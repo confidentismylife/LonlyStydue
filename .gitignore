@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据集（太大，不提交）
+data/raw/
+data/processed/
+
+# 模型权重（太大，不提交）
+checkpoints/*.pth
+checkpoints/*.pt
+
+# 生成的图片
+demo_sample_*.png
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系统文件
+.DS_Store
+Thumbs.db

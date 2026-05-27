@@ -1,0 +1,17 @@
+# ===== 核心依赖 =====
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+tqdm>=4.65.0
+
+# ===== 目标检测（第二阶段的YOLO）=====
+# ultralytics>=8.0.0  # 有GPU后再装
+
+# ===== 图神经网络（第三阶段）=====
+# torch-geometric>=2.3.0  # 有GPU后再装
+
+# ===== 大模型调用（第四阶段）=====
+# openai>=1.0.0
