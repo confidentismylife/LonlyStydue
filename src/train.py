@@ -1,86 +1,114 @@
 """
-训练脚本 — 用 ETH/UCY 数据集训练 Social-LSTM 轨迹预测模型
-纯 CPU 可跑（建议用 Colab GPU 加速），每 epoch 约 30 秒
+训练脚本 — Social-LSTM + 社交池化，支持场景批处理加速
 """
 
-import os, sys, time
+import os, sys, time, random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# 修复 Windows GBK 编码问题
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 
-from src.config import OBS_LEN, PRED_LEN, BATCH_SIZE, LR, EPOCHS, CHECKPOINT_DIR
-from src.data_loader import load_eth_ucy_file, extract_trajectories, normalize_trajectories
-from src.model import SimpleLSTM, SocialLSTM
-
-
-# ================================================================
-# PyTorch Dataset — 把 numpy 数据包成 DataLoader 能吃的格式
-# ================================================================
-class TrajectoryDataset(Dataset):
-    def __init__(self, obs, preds):
-        """
-        obs: (N, 8, 2) numpy 数组 — 观测轨迹
-        preds: (N, 12, 2) numpy 数组 — 真实未来轨迹
-        """
-        self.obs = torch.from_numpy(obs).float()
-        self.preds = torch.from_numpy(preds).float()
-
-    def __len__(self):
-        return len(self.obs)
-
-    def __getitem__(self, idx):
-        return self.obs[idx], self.preds[idx]
+from src.config import (
+    OBS_LEN, PRED_LEN, LR, EPOCHS, CHECKPOINT_DIR,
+    SOCIAL_EMBEDDING_DIM, SOCIAL_HIDDEN_DIM,
+    SOCIAL_GRID_SIZE, SOCIAL_NEIGHBORHOOD_SIZE,
+    SOCIAL_ACCUM_STEPS, SOCIAL_WINDOW_STRIDE, SOCIAL_GRAD_CLIP,
+)
+from src.model import SocialLSTM
+from src.scene_data_loader import build_scene_dataset
 
 
-# ================================================================
-# 训练一个 epoch
-# ================================================================
-def train_epoch(model, dataloader, optimizer, criterion, device):
+# 场景批大小 — 每次拼 N 个场景一起前向，增加矩阵尺寸榨干 CPU
+SCENE_BATCH = 6
+
+
+def pack_scenes(windows):
+    """把一组场景窗口打包成一个大张量"""
+    total_peds = sum(len(w.ped_ids) for w in windows)
+    obs = torch.zeros(total_peds, OBS_LEN, 2)
+    preds = torch.zeros(total_peds, PRED_LEN, 2)
+    scene_ids = torch.zeros(total_peds, dtype=torch.long)
+    ped_counts = []
+
+    offset = 0
+    for sid, w in enumerate(windows):
+        P = len(w.ped_ids)
+        obs[offset:offset + P] = torch.from_numpy(w.obs_traj)
+        preds[offset:offset + P] = torch.from_numpy(w.pred_traj)
+        scene_ids[offset:offset + P] = sid
+        ped_counts.append(P)
+        offset += P
+
+    return obs, preds, scene_ids, ped_counts
+
+
+def train_epoch(model, windows, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
-    for obs, preds in dataloader:
-        obs = obs.to(device)        # (batch, 8, 2)
-        preds = preds.to(device)    # (batch, 12, 2)
+    total_peds = 0
+    random.shuffle(windows)
 
-        optimizer.zero_grad()
-        output = model(obs)         # (batch, 12, 2)
-        loss = criterion(output, preds)
-        loss.backward()
-        optimizer.step()
+    optimizer.zero_grad()
+    n = len(windows)
 
-        total_loss += loss.item() * obs.size(0)
+    for batch_start in range(0, n, SCENE_BATCH):
+        batch_end = min(batch_start + SCENE_BATCH, n)
+        batch_wins = windows[batch_start:batch_end]
 
-    return total_loss / len(dataloader.dataset)
-
-
-# ================================================================
-# 验证 — 算 ADE 和 FDE
-# ================================================================
-@torch.no_grad()
-def validate(model, dataloader, device):
-    model.eval()
-    ade_sum, fde_sum, count = 0.0, 0.0, 0
-    for obs, preds in dataloader:
+        obs, preds, scene_ids, ped_counts = pack_scenes(batch_wins)
         obs = obs.to(device)
         preds = preds.to(device)
-        output = model(obs)  # (batch, 12, 2)
+        scene_ids = scene_ids.to(device)
 
-        # ADE: 所有时间步的平均 L2 距离
-        diff = output - preds  # (batch, 12, 2)
-        ade = torch.norm(diff, dim=2).mean(dim=1)  # (batch,) — 每条轨迹的平均误差
+        output = model(obs, scene_ids)  # (total_P, 12, 2)
 
-        # FDE: 最后一帧的 L2 距离
-        fde = torch.norm(diff[:, -1, :], dim=1)     # (batch,)
+        # 按每个场景独立算 loss，再平均
+        loss = 0.0
+        offset = 0
+        for P in ped_counts:
+            loss += criterion(output[offset:offset + P], preds[offset:offset + P]) / P
+            offset += P
+        loss = loss / len(ped_counts)
+        loss.backward()
+
+        total_loss += loss.item() * sum(ped_counts)
+        total_peds += sum(ped_counts)
+
+        batch_idx = batch_start // SCENE_BATCH + 1
+        if batch_idx % SOCIAL_ACCUM_STEPS == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), SOCIAL_GRAD_CLIP)
+            optimizer.step()
+            optimizer.zero_grad()
+
+    total_batches = (n + SCENE_BATCH - 1) // SCENE_BATCH
+    if total_batches % SOCIAL_ACCUM_STEPS != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), SOCIAL_GRAD_CLIP)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return total_loss / total_peds if total_peds > 0 else 0.0
+
+
+@torch.no_grad()
+def validate(model, windows, device):
+    model.eval()
+    ade_sum, fde_sum, count = 0.0, 0.0, 0
+
+    for batch_start in range(0, len(windows), SCENE_BATCH):
+        batch_end = min(batch_start + SCENE_BATCH, len(windows))
+        batch_wins = windows[batch_start:batch_end]
+
+        obs, preds, scene_ids, ped_counts = pack_scenes(batch_wins)
+        obs = obs.to(device)
+        preds = preds.to(device)
+        scene_ids = scene_ids.to(device)
+
+        output = model(obs, scene_ids)
+
+        diff = output - preds
+        ade = torch.norm(diff, dim=2).mean(dim=1)
+        fde = torch.norm(diff[:, -1, :], dim=1)
 
         ade_sum += ade.sum().item()
         fde_sum += fde.sum().item()
@@ -89,151 +117,90 @@ def validate(model, dataloader, device):
     return ade_sum / count, fde_sum / count
 
 
-# ================================================================
-# 主流程
-# ================================================================
 def main():
-    # ---- 检测设备 ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"设备: {device}")
-    if device.type == "cpu":
-        print("提示: CPU 训练较慢，建议把代码上传 Colab 用免费 GPU")
 
-    # ---- 加载数据 ----
-    print("\n加载数据集...")
     social_stgcnn_data = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "..", "Social-STGCNN", "datasets"
     )
-
-    # 递归查找所有 .txt 文件，去重（同一个文件名只加载一次）
-    seen = set()
-    all_files = []
-    for root, dirs, files in os.walk(social_stgcnn_data):
-        # 跳过 raw 和 test-cpu 目录（原始未拆分数据）
-        if "raw" in root or "test-cpu" in root:
-            continue
-        for f in files:
-            if f.endswith(".txt") and f not in seen:
-                seen.add(f)
-                all_files.append(os.path.join(root, f))
-
-    print(f"找到 {len(all_files)} 个唯一数据文件")
-    datasets = {}
-    for fpath in sorted(all_files):
-        fname = os.path.basename(fpath)
-        raw = load_eth_ucy_file(fpath)
-        obs, preds = extract_trajectories(raw)
-        if len(obs) == 0:
-            continue
-        print(f"  {os.path.basename(os.path.dirname(fpath))}/{fname}: {len(obs)} 条")
-
-        # 文件名 → 数据集名映射
-        fname_lower = fname.lower()
-        for keyword, key in [("eth", "eth"), ("hotel", "hotel"),
-                              ("zara01", "zara1"), ("zara02", "zara2"),
-                              ("zara03", "zara3"), ("students", "univ"),
-                              ("uni_examples", "univ")]:
-            if keyword in fname_lower:
-                dataset_key = key
-                break
-        else:
-            dataset_key = "other"
-
-        if dataset_key not in datasets:
-            datasets[dataset_key] = {"train": ([], []), "val": ([], [])}
-
-        if "val" in fname_lower:
-            datasets[dataset_key]["val"][0].append(obs)
-            datasets[dataset_key]["val"][1].append(preds)
-        else:
-            datasets[dataset_key]["train"][0].append(obs)
-            datasets[dataset_key]["train"][1].append(preds)
-
-    # 合并每个数据集
-    for name in datasets:
-        for split in ["train", "val"]:
-            obs_list, preds_list = datasets[name][split]
-            if obs_list:
-                datasets[name][split] = (
-                    np.concatenate(obs_list), np.concatenate(preds_list)
-                )
-            else:
-                datasets[name][split] = (np.array([]), np.array([]))
-
-    # 选第一个有数据的数据集来训练
-    train_obs, train_preds = None, None
-    val_obs, val_preds = None, None
-    for name in ["eth", "hotel", "univ", "zara1", "zara2"]:
-        t_obs, t_preds = datasets[name]["train"]
-        v_obs, v_preds = datasets[name]["val"]
-        if len(t_obs) > 0:
-            train_obs, train_preds = t_obs, t_preds
-            val_obs, val_preds = v_obs, v_preds
-            print(f"\n使用数据集: {name}")
-            break
-
-    if train_obs is None:
-        print("错误: 没有找到训练数据")
+    if not os.path.exists(social_stgcnn_data):
+        print(f"数据目录不存在: {social_stgcnn_data}")
+        print("请先克隆: git clone https://github.com/abduallahmohamed/Social-STGCNN.git")
         return
 
-    # ---- 归一化 ----
-    train_obs_n, train_preds_n = normalize_trajectories(train_obs, train_preds)
-    if len(val_obs) > 0:
-        val_obs_n, val_preds_n = normalize_trajectories(val_obs, val_preds)
-    else:
-        # 没有验证集的话用训练集最后 20% 做验证
-        split = int(len(train_obs_n) * 0.8)
-        val_obs_n, val_preds_n = train_obs_n[split:], train_preds_n[split:]
-        train_obs_n, train_preds_n = train_obs_n[:split], train_preds_n[:split]
+    print("构建场景数据集...")
+    all_windows = build_scene_dataset(
+        social_stgcnn_data,
+        obs_len=OBS_LEN,
+        pred_len=PRED_LEN,
+        stride=SOCIAL_WINDOW_STRIDE,
+    )
+    print(f"场景窗口总数: {len(all_windows)}")
 
-    print(f"训练集: {len(train_obs_n)} 条 | 验证集: {len(val_obs_n)} 条")
+    if len(all_windows) == 0:
+        print("错误: 没有提取到任何场景窗口")
+        return
 
-    # ---- DataLoader ----
-    train_dataset = TrajectoryDataset(train_obs_n, train_preds_n)
-    val_dataset = TrajectoryDataset(val_obs_n, val_preds_n)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    ped_counts = [len(w.ped_ids) for w in all_windows]
+    print(f"每场景行人数: min={min(ped_counts)}, max={max(ped_counts)}, "
+          f"avg={np.mean(ped_counts):.1f}")
 
-    # ---- 模型、损失函数、优化器 ----
-    # 先用轻量版 SimpleLSTM，CPU 上也能跑
-    model = SimpleLSTM(hidden_dim=32, pred_len=PRED_LEN).to(device)
-    criterion = nn.MSELoss()
+    random.seed(42)
+    random.shuffle(all_windows)
+    split = int(len(all_windows) * 0.8)
+    train_windows = all_windows[:split]
+    val_windows = all_windows[split:]
+    print(f"训练场景: {len(train_windows)} | 验证场景: {len(val_windows)}")
+    print(f"场景批大小: {SCENE_BATCH} | 预计每批 {np.mean(ped_counts) * SCENE_BATCH:.0f} 行人")
+
+    model = SocialLSTM(
+        embedding_dim=SOCIAL_EMBEDDING_DIM,
+        hidden_dim=SOCIAL_HIDDEN_DIM,
+        obs_len=OBS_LEN,
+        pred_len=PRED_LEN,
+        grid_size=SOCIAL_GRID_SIZE,
+        neighborhood_size=SOCIAL_NEIGHBORHOOD_SIZE,
+    ).to(device)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"\n模型参数量: {param_count:,}")
+    print(f"  embedding_dim={SOCIAL_EMBEDDING_DIM}, "
+          f"hidden_dim={SOCIAL_HIDDEN_DIM}, "
+          f"grid={SOCIAL_GRID_SIZE}x{SOCIAL_GRID_SIZE}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10
     )
-
-    print(f"\n模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    criterion = nn.MSELoss()
+    print(f"累积步数: {SOCIAL_ACCUM_STEPS} | 梯度裁剪: {SOCIAL_GRAD_CLIP}")
     print("=" * 60)
 
-    # ---- 训练循环 ----
     best_ade = float("inf")
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_ade, val_fde = validate(model, val_loader, device)
-        scheduler.step(val_ade)  # 根据验证 ADE 调整学习率
+        train_loss = train_epoch(model, train_windows, optimizer, criterion, device)
+        val_ade, val_fde = validate(model, val_windows, device)
+        scheduler.step(val_ade)
 
-        elapsed = time.time() - t0
-
-        # 保存最佳模型
         if val_ade < best_ade:
             best_ade = val_ade
             os.makedirs(CHECKPOINT_DIR, exist_ok=True)
             torch.save(model.state_dict(),
                        os.path.join(CHECKPOINT_DIR, "best_model.pth"))
 
+        elapsed = time.time() - t0
         if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{EPOCHS} | "
-                  f"Loss: {train_loss:.4f} | "
-                  f"ADE: {val_ade:.3f}m | FDE: {val_fde:.3f}m | "
-                  f"Time: {elapsed:.1f}s")
+            print(f"Epoch {epoch:3d}/{EPOCHS} | Loss: {train_loss:.4f} | "
+                  f"ADE: {val_ade:.3f}m | FDE: {val_fde:.3f}m | {elapsed:.0f}s")
 
     print("=" * 60)
-    print(f"\n训练完成！最佳验证 ADE: {best_ade:.3f} 米")
+    print(f"\n训练完成! 最佳验证 ADE: {best_ade:.3f}m")
     print(f"模型已保存到: {CHECKPOINT_DIR}/best_model.pth")
+    print("对比基线: SimpleLSTM 约 0.37m | 匀速基线 0.48m")
 
 
 if __name__ == "__main__":

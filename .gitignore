@@ -26,3 +26,4 @@ demo_sample_*.png
 # 系统文件
 .DS_Store
 Thumbs.db
+~$*

@@ -1,74 +1,89 @@
 """
 Social-LSTM 行人轨迹预测模型
-不同于 Social-STGCNN（图卷积），这个用 LSTM + 社交池化，
-代码更直观，CPU 上也能跑，适合你作为第一个深度学习基线。
-
 论文: Alahi et al., "Social LSTM: Human Trajectory Prediction in Crowded Spaces", CVPR 2016
 """
 
 import torch
 import torch.nn as nn
 
+from src.social_pooling import SocialPooling
+
 
 class SocialLSTM(nn.Module):
     """
-    对每个行人用独立的 LSTM 编码其历史轨迹，
-    用一个可学习的线性层把隐藏状态映射为未来 12 帧的坐标。
+    完整 Social-LSTM: 用 LSTMCell 逐时间步处理，每步对周围行人的隐藏状态
+    做社交池化，让每个行人"看见"周围的人。
+
+    编码阶段 (t=0..obs_len-1): 逐帧输入观测位置 → 社交池化 → LSTMCell
+    解码阶段 (t=obs_len..obs_len+pred_len-1): 自回归预测位移，预测位置继续社交池化
     """
 
-    def __init__(self, input_dim=2, hidden_dim=64, output_dim=2, pred_len=12):
-        """
-        参数:
-            input_dim:  输入维度，2 表示 (x, y) 坐标
-            hidden_dim: LSTM 隐藏层大小
-            output_dim: 输出维度，2 表示预测的 (dx, dy)
-            pred_len:   需要预测的未来帧数
-        """
+    def __init__(self, embedding_dim=64, hidden_dim=128, output_dim=2,
+                 obs_len=8, pred_len=12, grid_size=4, neighborhood_size=32):
         super().__init__()
+        self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
+        self.obs_len = obs_len
         self.pred_len = pred_len
+        self.output_dim = output_dim
 
-        # 编码器：把 (x, y) 坐标逐帧嵌入到 64 维空间
-        self.encoder_embed = nn.Linear(input_dim, 16)
+        self.pos_embedding = nn.Linear(2, embedding_dim)
+        self.social_pool = SocialPooling(grid_size=grid_size,
+                                         neighborhood_size=neighborhood_size)
+        self.social_embedding = nn.Linear(
+            grid_size * grid_size * hidden_dim, embedding_dim
+        )
+        self.lstm_cell = nn.LSTMCell(
+            input_size=embedding_dim * 2, hidden_size=hidden_dim
+        )
+        self.output_layer = nn.Linear(hidden_dim, 2)
+        self.relu = nn.ReLU()
 
-        # 单层 LSTM：读取 8 帧观测，输出隐藏状态
-        self.lstm = nn.LSTM(input_size=16, hidden_size=hidden_dim,
-                            num_layers=1, batch_first=True)
-
-        # 解码器：从隐藏状态一步预测全部 12 帧的位移
-        # 输入 64 维 → 输出 12*2=24 个数（12 帧 × 2 坐标）
-        self.decoder = nn.Linear(hidden_dim, pred_len * output_dim)
-
-    def forward(self, obs):
+    def forward(self, obs, scene_ids=None):
         """
-        前向传播。
+        obs:       (P, obs_len, 2) — P 个行人的观测轨迹（已归一化）
+        scene_ids: (P,) optional — 场景 ID，批量训练时隔离不同场景
 
-        参数:
-            obs: (batch, 8, 2) — 观测轨迹
-        返回:
-            pred: (batch, 12, 2) — 预测轨迹（相对位移）
+        Returns:
+            pred: (P, pred_len, 2) — 预测位移
         """
-        batch_size = obs.size(0)
+        P = obs.size(0)
+        H = self.hidden_dim
+        device = obs.device
 
-        # Step 1: 嵌入 — (batch, 8, 2) → (batch, 8, 16)
-        x = self.encoder_embed(obs)
+        h_t = torch.zeros(P, H, device=device)
+        c_t = torch.zeros(P, H, device=device)
 
-        # Step 2: LSTM 编码 — 输出 (batch, 8, 64)，取最后时刻的 hidden
-        lstm_out, (hidden, cell) = self.lstm(x)
-        # hidden: (1, batch, 64) → (batch, 64)
-        hidden_last = hidden[-1]
+        for t in range(self.obs_len):
+            pos_t = obs[:, t, :]
+            pos_emb = self.relu(self.pos_embedding(pos_t))
+            pooled = self.social_pool(pos_t, h_t, scene_ids)
+            pooled_flat = pooled.view(P, -1)
+            social_emb = self.relu(self.social_embedding(pooled_flat))
+            lstm_input = torch.cat([pos_emb, social_emb], dim=1)
+            h_t, c_t = self.lstm_cell(lstm_input, (h_t, c_t))
 
-        # Step 3: 解码 — (batch, 64) → (batch, 24) → (batch, 12, 2)
-        out = self.decoder(hidden_last)
-        pred = out.view(batch_size, self.pred_len, 2)
+        current_pos = obs[:, -1, :]
+        displacements = []
 
-        return pred
+        for t in range(self.pred_len):
+            pos_emb = self.relu(self.pos_embedding(current_pos))
+            pooled = self.social_pool(current_pos, h_t, scene_ids)
+            pooled_flat = pooled.view(P, -1)
+            social_emb = self.relu(self.social_embedding(pooled_flat))
+            lstm_input = torch.cat([pos_emb, social_emb], dim=1)
+            h_t, c_t = self.lstm_cell(lstm_input, (h_t, c_t))
+            displacement = self.output_layer(h_t)
+            displacements.append(displacement)
+            current_pos = current_pos + displacement
+
+        return torch.stack(displacements, dim=1)
 
 
 class SimpleLSTM(nn.Module):
     """
-    更轻量的版本：不嵌入了，直接把 (x,y) 丢进 LSTM。
-    参数量更小，CPU 训练更快，适合快速实验。
+    轻量基线版本：不嵌入了，直接把 (x,y) 丢进 LSTM。
+    每条轨迹独立预测，无社交交互。
     """
 
     def __init__(self, input_dim=2, hidden_dim=32, output_dim=2, pred_len=12):
@@ -83,5 +98,5 @@ class SimpleLSTM(nn.Module):
         # obs: (batch, 8, 2)
         lstm_out, (hidden, cell) = self.lstm(obs)
         hidden_last = hidden[-1]  # (batch, hidden_dim)
-        out = self.decoder(hidden_last)  # (batch, 24)
+        out = self.decoder(hidden_last)
         return out.view(obs.size(0), self.pred_len, 2)
